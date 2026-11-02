@@ -37,7 +37,7 @@ jobs:
         with:
           image: seir-cobol-finance:ci
           # Fail only on CRITICAL until the base image is hardened; tighten to high afterwards.
-          args: --file=Dockerfile --severity-threshold=critical
+          args: --file=Dockerfile --severity-threshold=critical --policy-path=.snyk
 
   terraform:
     name: Terraform fmt and validate
