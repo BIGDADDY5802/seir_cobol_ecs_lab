@@ -327,6 +327,36 @@ aws ecs deregister-task-definition --task-definition "$BAD_TD"
 
 ---
 
+## Issue 13 — `docker desktop start` fails inside Ubuntu
+
+**Phase:** Option B, before pushing the image
+
+**Symptom:**
+
+```text
+docker desktop start
+✗ Failed to start Docker Desktop
+starting Docker Desktop: fork/exec /opt/docker-desktop/bin/com.docker.backend: no such file or directory
+```
+
+**Cause:** Docker Desktop is a Windows application. Inside WSL2 Ubuntu, `docker desktop start` looks for a Linux install of Docker Desktop, which does not exist. Ubuntu only has the Docker CLI wired to the Windows engine.
+
+**Fix:** Run it from Windows PowerShell:
+
+```powershell
+docker desktop start
+```
+
+**Verify (from Ubuntu):**
+
+```bash
+docker version --format '{{.Server.Version}}'
+```
+
+A version number means the engine is running and reachable from Ubuntu.
+
+---
+
 ## Diagnostic guide: reading ECS task failures
 
 | `stopCode` | `exitCode` | Reason contains | Meaning | Where to fix |
@@ -350,7 +380,7 @@ aws ecs deregister-task-definition --task-definition "$BAD_TD"
 |---|---|---|---|
 | 1 | Base-image CVEs | 7 HIGH: `util-linux` ×5 (2.38.1-5+deb12u3), `glibc` ×1 (2.36-9+deb12u14), `zlib` ×1 (1.2.13.dfsg-1) | Check for Debian patches (`apt list --upgradable` in image); patch in Dockerfile or change base image; rescan and compare |
 | 2 | Mutable ECR tags | `lab1` overwritten in Drill 5.2 | Enable tag immutability; deploy by digest or unique tags |
-| 3 | No log retention | `create-log-group` sets no retention | Set a retention policy on `/ecs/seir-cobol-batch` |
+| 3 | ~~No log retention~~ ✅ Resolved | `create-log-group` sets no retention | **Resolved in Option B:** Terraform sets `retention_in_days = 7` |
 | 4 | Errors swallowed in `deploy.sh` | `create-log-group ... 2>/dev/null \|\| true` hides all failures | Only ignore `ResourceAlreadyExistsException` |
 | 5 | Wide-open egress | SG outbound `0.0.0.0/0`, public IP assigned | Private subnet with VPC endpoints for ECR, S3, CloudWatch Logs |
 | 6 | No ECR lifecycle policy | Console: "No lifecycle policy"; untagged images from drills accumulate | Add a lifecycle rule to expire untagged images |
@@ -358,15 +388,14 @@ aws ecs deregister-task-definition --task-definition "$BAD_TD"
 
 ---
 
-## Files and state left in place
+## Final state of the account
 
 | Item | State |
 |---|---|
-| `~/seir_cobol_ecs_lab/hello.cbl` | Restored, matches `hello.cbl.orig` |
-| `~/seir_cobol_ecs_lab/task-def-badtag.json` | Drill artifact; safe to delete |
-| ECR `seir-cobol-finance:lab1` | Points to good image (`f7328142...`) |
-| Task definition `seir-cobol-batch:3` | Active, good |
-| Task definition `seir-cobol-batch:4` | INACTIVE (bad tag) |
-| IAM role `seir-ecs-task-execution-lab` | Policy attached, matches original |
+| Option A resources | Torn down manually and verified |
+| Option B resources | Removed with `terraform destroy` (7 destroyed) |
+| Terraform state | Remote in S3, empty after destroy; prior version retained by bucket versioning |
+| Default VPC and subnets | Untouched (shared) |
 | Running tasks | None |
+| Local drill artifacts | `task-def-badtag.json`, `hello.cbl.orig`, `*.tfplan` (all gitignored) |
 | Docker settings backup | `%APPDATA%\Docker\settings-store.json.bak` |

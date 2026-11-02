@@ -3,8 +3,10 @@
 
 ![Lab Status](https://img.shields.io/badge/lab-complete-success)
 ![Failure Drills](https://img.shields.io/badge/failure%20drills-4%2F4%20passed-success)
-![Cleanup](https://img.shields.io/badge/cleanup-deferred-yellow)
-![Hardening](https://img.shields.io/badge/hardening-backlog%207%20items-orange)
+![Option A](https://img.shields.io/badge/Option%20A-script-success)
+![Option B](https://img.shields.io/badge/Option%20B-Terraform-success)
+![Cleanup](https://img.shields.io/badge/cleanup-complete-success)
+![Hardening](https://img.shields.io/badge/hardening-6%20open%20%2F%201%20resolved-orange)
 
 ![COBOL](https://img.shields.io/badge/COBOL-GnuCOBOL-005CA5)
 ![AWS ECS](https://img.shields.io/badge/AWS-ECS%20Fargate-FF9900?logo=amazonecs&logoColor=white)
@@ -12,6 +14,8 @@
 ![CloudWatch](https://img.shields.io/badge/AWS-CloudWatch%20Logs-FF4F8B?logo=amazoncloudwatch&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-29.9-2496ED?logo=docker&logoColor=white)
 ![Bash](https://img.shields.io/badge/Bash-script-4EAA25?logo=gnubash&logoColor=white)
+![Terraform](https://img.shields.io/badge/Terraform-1.17-7B42BC?logo=terraform&logoColor=white)
+![State](https://img.shields.io/badge/state-remote%20S3%20%2B%20locking-569A31?logo=amazons3&logoColor=white)
 ![WSL2](https://img.shields.io/badge/WSL2-Ubuntu-E95420?logo=ubuntu&logoColor=white)
 ![Region](https://img.shields.io/badge/region-us--east--1-232F3E?logo=amazonaws&logoColor=white)
 
@@ -19,7 +23,7 @@
 **Date completed:** 2026-11-01
 **Region:** us-east-1
 **Build host:** Windows 11 + WSL2 (Ubuntu) + Docker Desktop 4.97.0
-**Provisioning option:** Option A (`deploy.sh`)
+**Provisioning options:** Option A (`deploy.sh`), then torn down and rebuilt with Option B (Terraform, remote state)
 
 > This document is the **clean happy path**: what to run, in order, and what correct output looks like. Problems hit along the way and how they were fixed are in `Runbook.md`.
 >
@@ -147,7 +151,7 @@ Docker version 29.9.2, build a82e528
     "Account": "<ACCOUNT_ID>",
     "Arn": "arn:aws:iam::<ACCOUNT_ID>:user/awscli"
 }
-vpc-035440d5ab0a4ab71
+vpc-<VPC_ID>
 ```
 
 The final command returned a VPC ID, not `None`. ✅
@@ -456,28 +460,239 @@ Not part of this lab. Ready to proceed to the COBOL HTTP adapter / ECS service l
 
 ---
 
-### 7. Cleanup
 
-**Status: deferred.** Resources are retained for a follow-up hardening session (ECR scan comparison). Confirmed nothing is running and incurring compute cost:
+### 7. Cleanup — Option A teardown
+
+The README requires choosing **one** provisioning option per account, because both create resources with the same names. Option A was torn down completely before running Option B.
+
+**Before:** confirmed nothing was running and the cluster had no services.
 
 ```bash
-aws ecs list-tasks --cluster seir-module3 --desired-status RUNNING
+aws ecs list-tasks --cluster seir-module3 --desired-status RUNNING --query taskArns
+aws ecs describe-clusters --clusters seir-module3 \
+  --query 'clusters[0].{status:status,running:runningTasksCount,services:activeServicesCount}'
 ```
 
 ```text
-{ "taskArns": [] }
+[]
+{ "status": "ACTIVE", "running": 0, "services": 0 }
 ```
 
-Cleanup to be performed afterward per README Section 7:
+**Teardown, one resource at a time, verifying each:**
 
 ```bash
-export AWS_REGION=us-east-1
-aws ecs delete-cluster --cluster seir-module3 --region "$AWS_REGION"
-aws ecr delete-repository --repository-name seir-cobol-finance --force --region "$AWS_REGION"
-aws logs delete-log-group --log-group-name /ecs/seir-cobol-batch --region "$AWS_REGION"
+# 1. ECS cluster
+aws ecs delete-cluster --cluster seir-module3
+
+# 2. ECR repository and images
+aws ecr delete-repository --repository-name seir-cobol-finance --force
+
+# 3. CloudWatch log group
+aws logs delete-log-group --log-group-name /ecs/seir-cobol-batch
+
+# 4. Security group (confirmed no ENIs still attached first)
+aws ec2 describe-network-interfaces --filters Name=group-id,Values=<SG_ID> \
+  --query 'NetworkInterfaces[].NetworkInterfaceId'
+aws ec2 delete-security-group --group-id <SG_ID>
+
+# 5. IAM role (confirmed no inline policies; detached managed policy first)
+aws iam list-role-policies --role-name seir-ecs-task-execution-lab --query PolicyNames
+aws iam detach-role-policy --role-name seir-ecs-task-execution-lab \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam delete-role --role-name seir-ecs-task-execution-lab
+
+# 6. Retire remaining active task definition revisions
+for td in $(aws ecs list-task-definitions --family-prefix seir-cobol-batch --status ACTIVE \
+    --query 'taskDefinitionArns[]' --output text); do
+  aws ecs deregister-task-definition --task-definition "$td"
+done
 ```
 
-The security group `seir-cobol-no-ingress` and role `seir-ecs-task-execution-lab` will be removed manually after confirming neither is used elsewhere.
+**After:**
+
+| Resource | Before | After |
+|---|---|---|
+| ECS cluster | ACTIVE | `INACTIVE` ✅ |
+| ECR repository | exists | `RepositoryNotFoundException` ✅ |
+| Log group | exists | `[]` ✅ |
+| Security group | exists | `[]` ✅ |
+| IAM role | exists | `NoSuchEntity` ✅ |
+| Active task definitions | 3 | `[]` ✅ |
+
+The shared default VPC was not touched.
+
+---
+
+### 8. Option B — Terraform with remote state
+
+#### 8.1 Remote state backend
+
+State is stored remotely in an existing, private S3 bucket rather than on the laptop. The bucket has **versioning enabled**, **default encryption**, and **all public access blocked**. Terraform's native S3 locking (`use_lockfile`, Terraform 1.10+) prevents concurrent runs, so no DynamoDB table is needed.
+
+`terraform/backend.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "<STATE_BUCKET>"
+    key          = "seir-module3-lab01/terraform.tfstate"
+    region       = "<BUCKET_REGION>"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+The project uses its own `key` prefix so it cannot collide with other state files in the bucket.
+
+#### 8.2 Initialize, plan, apply
+
+```bash
+cd ~/seir_cobol_ecs_lab/terraform
+terraform init
+```
+
+```text
+Successfully configured the backend "s3"!
+- Installed hashicorp/aws v6.71.0 (signed by HashiCorp)
+Terraform has been successfully initialized!
+```
+
+Plan saved to a file, reviewed, then applied exactly as reviewed:
+
+```bash
+terraform plan -out=lab.tfplan
+terraform apply lab.tfplan
+```
+
+```text
+  # aws_cloudwatch_log_group.batch will be created
+  # aws_ecr_repository.cobol will be created
+  # aws_ecs_cluster.lab will be created
+  # aws_ecs_task_definition.batch will be created
+  # aws_iam_role.task_execution will be created
+  # aws_iam_role_policy_attachment.task_execution will be created
+  # aws_security_group.no_ingress will be created
+Plan: 7 to add, 0 to change, 0 to destroy.
+
+Apply complete! Resources: 7 added, 0 changed, 0 destroyed.
+```
+
+#### 8.3 Confirm state is remote
+
+```bash
+aws s3 ls "s3://<STATE_BUCKET>/seir-module3-lab01/"
+ls -la | grep -i tfstate || echo "No local state file - good"
+terraform state list
+```
+
+```text
+terraform.tfstate          (stored in S3)
+No local state file - good
+data.aws_caller_identity.current
+data.aws_subnets.default
+data.aws_vpc.default
+aws_cloudwatch_log_group.batch
+aws_ecr_repository.cobol
+aws_ecs_cluster.lab
+aws_ecs_task_definition.batch
+aws_iam_role.task_execution
+aws_iam_role_policy_attachment.task_execution
+aws_security_group.no_ingress
+```
+
+#### 8.4 Push the image and run the task
+
+Values are read from Terraform outputs instead of copied by hand:
+
+```bash
+REPO=$(terraform output -raw ecr_repository_url)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO%%/*}"
+docker build --platform linux/amd64 -t "$REPO:lab1" ..
+docker push "$REPO:lab1"
+
+TASK=$(aws ecs run-task --cluster "$(terraform output -raw cluster_name)" \
+  --launch-type FARGATE --task-definition "$(terraform output -raw task_definition_family)" --count 1 \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform output -raw subnet_id)],securityGroups=[$(terraform output -raw security_group_id)],assignPublicIp=ENABLED}" \
+  --region us-east-1 --query 'tasks[0].taskArn' --output text)
+aws ecs wait tasks-stopped --cluster seir-module3 --tasks "$TASK" --region us-east-1
+aws ecs describe-tasks --cluster seir-module3 --tasks "$TASK" --region us-east-1 \
+  --query 'tasks[0].{stopCode:stopCode,exitCode:containers[0].exitCode,taskDef:taskDefinitionArn}'
+aws logs tail /ecs/seir-cobol-batch --log-stream-name-prefix "ecs/cobol/${TASK##*/}" --region us-east-1
+```
+
+```text
+"stopCode": "EssentialContainerExited",
+"exitCode": 0,
+"taskDef": "arn:aws:ecs:us-east-1:<ACCOUNT_ID>:task-definition/seir-cobol-batch:5"
+
+... ecs/cobol/ea8f4b02b56f48378c659f11a98c0875 SEIR COBOL FINANCIAL BATCH v1
+... ecs/cobol/ea8f4b02b56f48378c659f11a98c0875 Opening: USD 0012500.00
+... ecs/cobol/ea8f4b02b56f48378c659f11a98c0875 Debit:   USD 0000250.00
+... ecs/cobol/ea8f4b02b56f48378c659f11a98c0875 Closing: USD 0012250.00
+... ecs/cobol/ea8f4b02b56f48378c659f11a98c0875 FINANCIAL INVARIANT PASSED
+```
+
+Exit code `0` on Terraform's task definition revision. ✅
+
+#### 8.5 Difference from Option A: log retention
+
+```bash
+aws logs describe-log-groups --log-group-name-prefix /ecs/seir-cobol-batch --region us-east-1 \
+  --query 'logGroups[0].{name:logGroupName,retentionDays:retentionInDays}'
+```
+
+```text
+{ "name": "/ecs/seir-cobol-batch", "retentionDays": 7 }
+```
+
+Option A set no retention (logs kept indefinitely). The Terraform version sets 7 days, closing hardening backlog item #3.
+
+#### 8.6 Terraform destroy
+
+Destroy plan saved and reviewed before applying:
+
+```bash
+terraform plan -destroy -out=destroy.tfplan
+terraform show -no-color destroy.tfplan | grep "will be destroyed"
+terraform apply destroy.tfplan
+```
+
+```text
+  # aws_cloudwatch_log_group.batch will be destroyed
+  # aws_ecr_repository.cobol will be destroyed
+  # aws_ecs_cluster.lab will be destroyed
+  # aws_ecs_task_definition.batch will be destroyed
+  # aws_iam_role.task_execution will be destroyed
+  # aws_iam_role_policy_attachment.task_execution will be destroyed
+  # aws_security_group.no_ingress will be destroyed
+
+Apply complete! Resources: 0 added, 0 changed, 7 destroyed.
+```
+
+The default VPC and subnets were read-only `data` lookups and were not touched. The state bucket was created outside this configuration and was not affected.
+
+```bash
+terraform state list
+```
+
+```text
+(empty)
+```
+
+The state file remains in S3 as an empty state, so the stack can be rebuilt with `terraform apply`. Bucket versioning retains the previous state version.
+
+---
+
+### Option A vs Option B
+
+| | Option A (script) | Option B (Terraform) |
+|---|---|---|
+| Build | `./deploy.sh` | `plan` → review → `apply` |
+| Log retention | None (indefinite) | 7 days |
+| State | None | Remote S3, versioned, encrypted, locked |
+| Teardown | 6 manual steps with verification | One reviewed destroy plan |
+| Result | `exitCode 0` | `exitCode 0` |
 
 ---
 
@@ -490,4 +705,6 @@ The security group `seir-cobol-no-ingress` and role `seir-ecs-task-execution-lab
 | 3. Deploy (Option A) | ✅ |
 | 4. Verify (ECR, ECS, CloudWatch, Security Group) | ✅ |
 | 5. Failure exercises (all 4) | ✅ |
-| 7. Cleanup | ⏸️ Deferred for hardening |
+| 7. Option A teardown | ✅ |
+| 8. Option B — Terraform with remote state | ✅ |
+| 8.6 Terraform destroy | ✅ |
