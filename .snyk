@@ -1,0 +1,13 @@
+# Snyk (https://snyk.io) policy file
+version: v1.25.0
+ignore:
+  SNYK-DEBIAN12-ZLIB-6008963:
+    - '*':
+        reason: >-
+          CVE-2023-45853 affects zlib's contrib/minizip. Debian marks bookworm
+          as <ignored>: minizip is not built into the zlib1g binary package used
+          by this image, and the COBOL batch job does not use minizip.
+          Revisit during base-image hardening.
+        expires: 2027-02-01T00:00:00.000Z
+        created: 2026-11-02T05:00:00.000Z
+patch: {}
