@@ -30,6 +30,14 @@ jobs:
         run: |
           docker run --rm --platform linux/amd64 seir-cobol-finance:ci | tee output.txt
           grep -q "FINANCIAL INVARIANT PASSED" output.txt
+      - name: Snyk container scan
+        uses: snyk/actions/docker@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: seir-cobol-finance:ci
+          # Fail only on CRITICAL until the base image is hardened; tighten to high afterwards.
+          args: --file=Dockerfile --severity-threshold=critical
 
   terraform:
     name: Terraform fmt and validate
